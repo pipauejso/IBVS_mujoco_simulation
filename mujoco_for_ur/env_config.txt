@@ -1,0 +1,19 @@
+# 1. 进入项目目录
+cd /home/ros2/Desktop/mujoco_for_ur
+
+# 2. 创建虚拟环境（名字叫 venv）
+python3 -m venv venv
+
+# 3. 激活虚拟环境
+source venv/bin/activate
+
+# 4. 升级 pip（重要！）
+pip install --upgrade pip
+
+# 5. 安装兼容的依赖（关键！全部用 pip 装）
+#    我们选择更稳定的 NumPy 1.x 方案（避免 MuJoCo/ROS 兼容问题）
+pip install "numpy>=1.21.6,<2" \
+            "scipy>=1.10" \
+            "matplotlib" \
+            "mujoco>=3.0" \
+            "roboticstoolbox-python"
