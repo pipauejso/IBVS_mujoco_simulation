@@ -1,4 +1,4 @@
-# 1. 进入项目目录
+# 1. 进入项目目录,我使用的python版本为3.10.12
 cd /home/ros2/Desktop/mujoco_for_ur
 
 # 2. 创建虚拟环境（名字叫 venv）
@@ -17,3 +17,4 @@ pip install "numpy>=1.21.6,<2" \
             "matplotlib" \
             "mujoco>=3.0" \
             "roboticstoolbox-python"
+            

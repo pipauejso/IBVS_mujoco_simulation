@@ -1,345 +1,238 @@
+# visual_servo_module.py
+# 完整的 VisualServoController 类（已修复深度、符号方向、稳定性问题）
+
 import numpy as np
 import cv2
+from scipy.spatial.transform import Rotation
 
 class VisualServoController:
-    def __init__(self, model, data, camera_name, target_site_name, resolution, lambda_gain=0.001):
+    def __init__(self, model, data, camera_name, target_name, resolution, lambda_gain=0.2):
         """
-        初始化视觉伺服控制器
-        
-        参数:
-        - model: Mujoco模型对象
-        - data: Mujoco数据对象
-        - camera_name: 相机名称
-        - target_site_name: 目标特征点的site名称
-        - resolution: 相机分辨率 (宽度, 高度)
-        - lambda_gain: 控制增益
+        初始化视觉伺服控制器（推荐 lambda_gain=0.1~0.3，避免振荡）
         """
         self.model = model
         self.data = data
         self.resolution = resolution
         self.lambda_gain = lambda_gain
-        
-        # 获取相机ID
-        self.camera_id = model.camera(camera_name).id
-        
-        # 获取目标site的ID和位置
-        self.target_site_id = model.site(target_site_name).id
-        
-        # 计算相机内参
-        self.fx, self.fy, self.cx, self.cy = self._calculate_camera_intrinsics()
-        
-        # 获取target的尺寸
-        self.target_size = model.site_size[self.target_site_id].copy()
-        
-        # 目标特征点在图像中的期望位置（初始化为当前位置）
-        self.desired_points = None
 
-        # 期望深度
-        self.desired_z = None
-        
-        # 当前特征点在图像中的位置
+        # camera / target ids
+        self.camera_id = model.camera(camera_name).id
+        self.target_body_id = model.body(target_name).id
+
+        # intrinsics
+        self.fx, self.fy, self.cx, self.cy = self._calculate_camera_intrinsics()
+
+        # target geom size (half-sizes for box)
+        self.target_size = self._get_target_size(target_name)
+
+        self.desired_points = None
+        self.desired_z = None  # 新增：期望深度
         self.current_points = None
 
-        self._get_depth_for_points()
-        
-        print(f"视觉伺服控制器: 相机内参 - fx={self.fx:.2f}, fy={self.fy:.2f}, cx={self.cx:.2f}, cy={self.cy:.2f}")
+        print(
+            f"视觉伺服控制器: 相机内参 - fx={self.fx:.2f}, fy={self.fy:.2f}, "
+            f"cx={self.cx:.2f}, cy={self.cy:.2f}"
+        )
         print(f"视觉伺服控制器: 目标尺寸 - {self.target_size}")
+
+    def _get_target_size(self, target_name):
+        body_id = self.model.body(target_name).id
+        for i in range(self.model.ngeom):
+            if self.model.geom_bodyid[i] == body_id:
+                return self.model.geom_size[i].copy()
+        return np.array([0.05, 0.05, 0.02], dtype=np.float64)
+
+    def _calculate_camera_intrinsics(self):
+        width, height = self.resolution
+        fovy_deg = float(self.model.cam_fovy[self.camera_id])
+        fovy = np.deg2rad(fovy_deg)
+        fx = fy = height / (2.0 * np.tan(fovy / 2.0))
+        cx = width / 2.0
+        cy = height / 2.0
+        return float(fx), float(fy), float(cx), float(cy)
+
     def _extract_features_from_image(self, image):
         """
-        从图像中提取红色矩形特征点。
-        根据成功脚本优化颜色阈值和形态学操作，确保准确检测红色目标的4个角点。
+        输出 4 个角点 (4x2, float32)，顺序: [左上, 右上, 右下, 左下]
         """
-        # 1. 转换到HSV颜色空间   小心：OpenCV默认是BGR，而Mujoco是RGB
         hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-        
-        # 2. 定义红色的HSV范围（使用成功脚本的阈值）
-        # 范围1: 0-10 (深红/橙红)
         lower_red1 = np.array([0, 70, 50])
         upper_red1 = np.array([10, 255, 255])
-        
-        # 范围2: 170-180 (紫红)
         lower_red2 = np.array([170, 70, 50])
         upper_red2 = np.array([180, 255, 255])
-
-        # 创建掩膜
         mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
         mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-        mask = mask1 + mask2  # 合并两个掩膜
+        mask = mask1 + mask2
 
-        # 3. 形态学操作
         kernel = np.ones((5, 5), np.uint8)
-        # 闭运算：填充内部孔洞（解决红色方块内的小蓝点问题）
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        # 膨胀操作：确保边缘平滑
         mask = cv2.dilate(mask, kernel, iterations=1)
 
-        # 4. 寻找轮廓
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
         if not contours:
             print("未检测到红色物体")
             return None, False
 
-        # 找到面积最大的轮廓（假设红色方块是主要的红色物体）
         largest_contour = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(largest_contour) < 20:
+            print("红色区域太小，忽略")
+            return None, False
 
-        # 5. 多边形拟合（获取4个角点）
-        epsilon = 0.02 * cv2.arcLength(largest_contour, True)
-        approx = cv2.approxPolyDP(largest_contour, epsilon, True)
+        rect = cv2.minAreaRect(largest_contour)
+        corners = cv2.boxPoints(rect).astype(np.float32)
 
-        # 处理拟合结果
-        corners = []
-        
-        if len(approx) == 4:
-            print("检测到精确的四边形。")
-            corners = approx.reshape(-1, 2)  # 转换为 (4, 2) 的数组
-        else:
-            print(f"检测到轮廓（拟合点数: {len(approx)}），使用最小外接矩形修正。")
-            rect = cv2.minAreaRect(largest_contour)
-            box = cv2.boxPoints(rect)
-            corners = np.int0(box).astype(np.float32)  # 转换为int后再转换为float32
+        # 亚像素精炼
+        try:
+            gray = mask.astype(np.uint8)
+            term = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.01)
+            corners = cv2.cornerSubPix(gray, corners.reshape(-1, 1, 2), (5, 5), (-1, -1), term).reshape(-1, 2)
+        except:
+            pass
 
-        # 6. 对四个角点进行排序：固定顺序 [左上，右上，右下，左下]
-        # 计算中心点
-        center = np.mean(corners, axis=0)
-        # 根据点与中心的相对位置排序
-        def sort_key(point):
-            diff = point - center
-            # 使用arctan2计算角度，从左上角开始逆时针排序
-            return np.arctan2(diff[1], diff[0])
-        
-        sorted_points = sorted(corners, key=sort_key)
-        # 调整起点，确保是左上角开始
-        sorted_points = np.roll(sorted_points, -np.argmin([p[0]+p[1] for p in sorted_points]), axis=0)
+        # 排序到固定顺序
+        center = corners.mean(axis=0)
+        angles = np.arctan2(corners[:, 1] - center[1], corners[:, 0] - center[0])
+        corners = corners[np.argsort(angles)]
+        start = np.argmin(corners[:, 0] + corners[:, 1])
+        corners = np.roll(corners, -start, axis=0)
 
-        return np.array(sorted_points, dtype=np.float32), True
+        # 修正方向（顺时针）
+        area2 = 0.0
+        for i in range(4):
+            x1, y1 = corners[i]
+            x2, y2 = corners[(i + 1) % 4]
+            area2 += (x1 * y2 - x2 * y1)
+        if area2 < 0:
+            corners = corners[[0, 3, 2, 1]]
 
-    def _calculate_camera_intrinsics(self):
-        """
-        根据相机fovy和图像分辨率计算相机内参
-        
-        返回:
-        - fx, fy: 焦距（像素单位）
-        - cx, cy: 主点坐标（像素单位）
-        """
-        width, height = self.resolution
-        
-        # 从MuJoCo模型获取相机fovy（弧度）
-        fovy = self.model.cam_fovy[self.camera_id]
-        
-        # 计算焦距
-        fx = fy = height / (2 * np.tan(fovy / 2))
-        
-        # 主点坐标（图像中心）
-        cx = width / 2
-        cy = height / 2
-        
-        return fx, fy, cx, cy
+        return corners.astype(np.float32), True
+
     def _get_depth_for_points(self):
-        """
-        为图像中提取的角点提供固定深度值。
-        """
-        P_w_tar = self.data.site_xpos[self.target_site_id].copy()
-        P_w_tar1 = P_w_tar.copy() +[self.target_size[0]/2, self.target_size[1]/2, 0] #左上
-        P_w_tar2 = P_w_tar.copy() +[self.target_size[0]/2, -self.target_size[1]/2, 0]#右上
-        P_w_tar3 = P_w_tar.copy() +[-self.target_size[0]/2, -self.target_size[1]/2, 0]#右下
-        P_w_tar4 = P_w_tar.copy() +[-self.target_size[0]/2, self.target_size[1]/2, 0]#左下
-
-        R_w_tar = self.data.site_xmat[self.target_site_id].reshape((3, 3))
+        P_w_tar = self.data.xpos[self.target_body_id].copy()
+        R_w_tar = self.data.xmat[self.target_body_id].reshape((3, 3))
+        hx, hy, _ = self.target_size
+        offsets_local = [
+            np.array([+hx, +hy, 0.0]),
+            np.array([+hx, -hy, 0.0]),
+            np.array([-hx, -hy, 0.0]),
+            np.array([-hx, +hy, 0.0]),
+        ]
+        P_w_corners = [P_w_tar + R_w_tar @ offset for offset in offsets_local]
 
         R_w_cam = self.data.cam_xmat[self.camera_id].reshape((3, 3))
         P_w_cam = self.data.cam_xpos[self.camera_id].copy()
+        R_cam_w = R_w_cam.T
 
-        P_w_cam_tar1 = P_w_tar1- P_w_cam
-        P_w_cam_tar2 = P_w_tar2- P_w_cam
-        P_w_cam_tar3 = P_w_tar3- P_w_cam
-        P_w_cam_tar4 = P_w_tar4- P_w_cam
-
-        ##R_cam_w 等于R_w_cam的转置
-        R_cam_w =   R_w_cam.T
-
-        P_cam_tar1 = R_cam_w @ P_w_cam_tar1
-        P_cam_tar2 = R_cam_w @ P_w_cam_tar2
-        P_cam_tar3 = R_cam_w @ P_w_cam_tar3
-        P_cam_tar4 = R_cam_w @ P_w_cam_tar4
-
-        self.desired_z = [-P_cam_tar1[2],-P_cam_tar2[2],-P_cam_tar3[2] ,-P_cam_tar4[2]]
-        return [P_cam_tar1[2],P_cam_tar2[2],P_cam_tar3[2] ,P_cam_tar4[2]]  # 固定深度值
+        depths = []
+        for P_w_corner in P_w_corners:
+            P_cam = R_cam_w @ (P_w_corner - P_w_cam)
+            depths.append(float(-P_cam[2]))  # 正深度
+        return depths
 
     def get_feature_points(self, image=None):
-        """
-        从图像中检测红色target的四个角点（优先图像处理，失败则回退模型计算）
-        参数:
-        - image: 输入图像（可选）
-        
-        返回:
-        - points: 检测到的4个角点的像素坐标 (4x2数组)
-        - Z: 固定深度值
-        """
-        # 优先使用图像处理方法
-        if image is not None and isinstance(image, np.ndarray):
-            points, success = self._extract_features_from_image(image)
-            if success:
-                # 图像处理成功，使用固定深度
-                #Z = 0.2
-                Z = self.desired_z
-                self.current_points = points
-                return points, Z
-        # 图像处理失败，打印警告并回退
-        print("视觉警告：图像处理未检测到目标，回退至模型计算。")
-    
-        # 回退到基于模型的方法
-        return False
+        if image is None or not isinstance(image, np.ndarray):
+            return None, None
 
+        points, success = self._extract_features_from_image(image)
+        if not success:
+            return None, None
 
-       
+        Z = self._get_depth_for_points()
+        self.current_points = points
+        return points, Z
+
     def set_desired_features(self, points_star):
-        """
-        设置特征点的期望位置
-        
-        参数:
-        - points_star: 4个角点的期望像素坐标 (4x2)
-        """
         self.desired_points = points_star
-        self._get_depth_for_points()
-    
+        self.desired_z = self._get_depth_for_points()  # 保存期望深度
+
     def calculate_interaction_matrix(self, points, Z):
-        """
-        计算交互矩阵L(s)
-        修改：为每个特征点使用独立的深度Z_i进行计算，提高精度。
-        """
-        # 如果Z是单个值，则扩展为每个点一个深度（使用平均值）
-        if np.isscalar(Z):
-            Z_array = np.full(4, Z)
-        else:
-            Z_array = Z
-    
-        L = np.zeros((8, 6))
-    
+        Z_array = np.asarray(Z, dtype=np.float64).reshape(-1)
+        L = np.zeros((8, 6), dtype=np.float64)
         for i in range(4):
-            u = points[i][0]
-            v = points[i][1]
-            Z_i = Z_array[i] if i < len(Z_array) else Z_array[0]  # 安全索引
-        
-            # 计算归一化坐标（更准确的公式）
+            u, v = float(points[i][0]), float(points[i][1])
+            Z_i = max(float(Z_array[i]), 1e-6)
             x = (u - self.cx) / self.fx
             y = (v - self.cy) / self.fy
-        
-            # 单个特征点的交互矩阵 (2x6) - 使用更标准的公式
             L_i = np.array([
-                [-1/Z_i, 0,     x/Z_i,     x*y,   -(1 + x*x),   y],
-                [0,     -1/Z_i, y/Z_i, 1 + y*y,       -x*y,   -x]
-                ])
-        
-            # 注意：上述公式中的焦距已被归一化坐标吸收
-            # 将单个特征点的交互矩阵添加到总交互矩阵中
-            L[2*i:2*i+2, :] = L_i
-    
+                [-1/Z_i, 0, x/Z_i, x*y, -(1 + x*x), y],
+                [0, -1/Z_i, y/Z_i, 1 + y*y, -x*y, -x]
+            ], dtype=np.float64)
+            L[2*i:2*i+2] = L_i
         return L
-    
-    def compute_robot_velocity(self, interaction_matrix, error, robot_jacobian):
-        """
-        计算机器人关节速度
-        
-        参数:
-        - interaction_matrix: 交互矩阵 (8x6)
-        - error: 特征误差 (8x1)
-        - robot_jacobian: 机器人雅可比矩阵 (6x6)
-        
-        返回:
-        - joint_velocities: 关节速度指令 (6x1)
-        """
-        # 计算相机速度
-        camera_velocity = -self.lambda_gain * np.linalg.pinv(interaction_matrix) @ error
-        
-        # 将相机速度转换为关节速度
-        joint_velocities = np.linalg.pinv(robot_jacobian) @ camera_velocity
-        
-        return joint_velocities
-    
+
     def process_visual_servo(self, robot_controller, current_joint_angles, image=None):
-        """
-        处理视觉伺服控制循环
-        
-        参数:
-        - robot_controller: 机器人控制器对象
-        - current_joint_angles: 当前关节角度
-        - image: 输入图像（可选）
-        
-        返回:
-        - joint_velocities: 关节速度指令 (6x1)，如果没有期望特征点则返回None
-        """
-        # 获取当前特征点
-        points, Z = self.get_feature_points(image)
-        
-        # 如果没有设置期望特征点，则使用当前位置作为期望位置
-        if self.desired_points is None:
-            self.desired_points = points
+        points, Z_current = self.get_feature_points(image)
+        if points is None:
             return None
-        
-        # 计算特征误差
-        error = np.zeros((8, 1))
+
+        # 如果未设置期望，使用当前位置
+        if self.desired_points is None:
+            self.set_desired_features(points)
+            print("已自动设置期望特征点为当前位置")
+            return None
+
+        # 误差：期望 - 当前（标准 e = s* - s）
+        error_norm = np.zeros((8, 1), dtype=np.float64)
+        error_pixel = np.zeros((8, 1))
         for i in range(4):
-            error[2*i] = self.desired_points[i][0] - points[i][0]
-            error[2*i+1] = self.desired_points[i][1] - points[i][1]
-        
-        # 如果误差很小，停止控制
-        if np.linalg.norm(error) < 2.0:
+            error_pixel[2*i]   = self.desired_points[i][0] - points[i][0]
+            error_pixel[2*i+1] = self.desired_points[i][1] - points[i][1]
+            error_norm[2*i]   = error_pixel[2*i] / self.fx
+            error_norm[2*i+1] = error_pixel[2*i+1] / self.fy
+
+        err_mag_pixel = np.linalg.norm(error_pixel)
+        print(f"\n=== 视觉伺服调试 ===")
+        print(f"深度值 Z: {[f'{z:.3f}' for z in Z_current]}")
+        print(f"特征误差: {err_mag_pixel:.2f} pixels")
+
+        if err_mag_pixel < 2.0:
+            print("误差小于阈值，停止控制")
             return np.zeros(6)
-        
-        # 计算交互矩阵
+
+        # 用期望深度计算 L（稳定）
+        Z = self.desired_z if self.desired_z is not None else Z_current
         L = self.calculate_interaction_matrix(points, Z)
-        
-        # 获取机器人雅可比矩阵
+        print(f"交互矩阵条件数: {np.linalg.cond(L):.2e}")
+
+        # 相机速度 v = -λ * L^+ * e
+        L_pinv = np.linalg.pinv(L)
+        camera_velocity = -self.lambda_gain * L_pinv @ error_norm
+        camera_velocity[2] = -camera_velocity[2]  # 符号修正
+
+        # 雅可比（body Jacobian）
         jacobian = robot_controller.robot.jacobe(current_joint_angles)
-        
-        # 计算关节速度
-        joint_velocities = self.compute_robot_velocity(L, error, jacobian)
-        
+        print(f"雅可比条件数: {np.linalg.cond(jacobian):.2e}")
+
+        # DLS 求解关节速度
+        damping = 0.05
+        J_T = jacobian.T
+        joint_velocities = J_T @ np.linalg.inv(jacobian @ J_T + damping**2 * np.eye(6)) @ camera_velocity
+
+        # 限幅
+        max_vel = 0.5
+        joint_velocities = np.clip(joint_velocities.flatten(), -max_vel, max_vel)
+        print(f"关节速度(限幅): {np.round(joint_velocities, 4)}")
+
         return joint_velocities
-    
+
     def draw_feature_points(self, image):
-        """
-        在图像上绘制特征点
-        
-        参数:
-        - image: 输入图像
-        
-        返回:
-        - image_with_features: 绘制了特征点的图像
-        """
         image_with_features = image.copy()
-        
-        # 绘制当前特征点
         if self.current_points is not None:
-            # 打印当前特征点坐标
-            print("4 个角点的坐标 (x, y):")
             for i in range(4):
-                u = int(self.current_points[i][0])
-                v = int(self.current_points[i][1])
-                print(f"点 {i+1}: ({u}, {v})")
-                
-                # 增大圆圈大小，使用蓝色实心圆
+                u = int(round(float(self.current_points[i][0])))
+                v = int(round(float(self.current_points[i][1])))
                 cv2.circle(image_with_features, (u, v), 8, (255, 0, 0), -1)
-                # 调整角点编号位置和样式
-                cv2.putText(image_with_features, str(i+1), (u-20, v-20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        
-        # 绘制期望特征点
+                cv2.putText(image_with_features, str(i+1), (u-20, v-20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
         if self.desired_points is not None:
             for i in range(4):
-                u = int(self.desired_points[i][0])
-                v = int(self.desired_points[i][1])
+                u = int(round(float(self.desired_points[i][0])))
+                v = int(round(float(self.desired_points[i][1])))
                 cv2.circle(image_with_features, (u, v), 8, (0, 0, 255), 2)
-                # 为期望点也添加编号
-                cv2.putText(image_with_features, str(i+1), (u-20, v-20), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-        
-        # 绘制连线
+                cv2.putText(image_with_features, str(i+1), (u-20, v-20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
         if self.current_points is not None and self.desired_points is not None:
-            # 绘制当前特征点的连线
-            cv2.polylines(image_with_features, [np.int32(self.current_points)], True, (255, 0, 0), 2)
-            # 绘制期望特征点的连线
-            cv2.polylines(image_with_features, [np.int32(self.desired_points)], True, (0, 0, 255), 2)
-        
+            cv2.polylines(image_with_features, [np.int32(np.round(self.current_points))], True, (255, 0, 0), 2)
+            cv2.polylines(image_with_features, [np.int32(np.round(self.desired_points))], True, (0, 0, 255), 2)
+
         return image_with_features

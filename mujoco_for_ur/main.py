@@ -14,11 +14,46 @@ def main():
     # 加载Mujoco模型
     model = mujoco.MjModel.from_xml_path('universal_robots_ur5e/scene.xml')
     data = mujoco.MjData(model)
-    
+
+
+    # 使用 keyframe 重置
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+        print(f"已加载初始姿态: {np.round(data.qpos[:6], 3)}")
+
+
+    # main.py：在 mj_resetDataKeyframe 之后立刻加
+    # 1) 清零速度，避免一开始带速度
+    data.qvel[:] = 0.0
+
+    # 2) 清零控制输入（期望速度）
+    actuator_names = [
+        "shoulder_pan_vel_init",
+        "shoulder_lift_vel_init",
+        "elbow_vel_init",
+        "wrist_1_vel_init",
+        "wrist_2_vel_init",
+        "wrist_3_vel_init",
+    ]
+    for name in actuator_names:
+        data.actuator(name).ctrl = 0.0
+
+    # 3) 关键：同步 intvelocity 的内部积分状态 data.act 到当前关节角
+    #    用 transmission 里绑定的 joint 找到 qpos 地址
+    if getattr(data, "act", None) is not None and data.act.size >= model.na:
+        for name in actuator_names:
+            aid = model.actuator(name).id
+            jid = model.actuator_trnid[aid][0]
+            qadr = model.jnt_qposadr[jid]
+            data.act[aid] = data.qpos[qadr]
+
+    mujoco.mj_forward(model, data)
+
+
     # 初始化各模块
     robot_controller = RobotController()
     actuator_controller = ActuatorController(model, data)
-    
+
     # 设置渲染分辨率
     resolution = (320, 240)
     
@@ -34,7 +69,7 @@ def main():
     
     # 初始化视觉伺服控制器
     visual_servo_controller = VisualServoController(
-        model, data, "end_effector_camera", "target", resolution, lambda_gain=0.1
+        model, data, "end_effector_camera", "target", resolution, lambda_gain=5.0
     )
     
     # 打印机器人信息
@@ -98,6 +133,12 @@ def main():
                     
                     for i, name in enumerate(actuator_names):
                         data.actuator(name).ctrl = joint_velocities[i]
+
+
+                    # 调试输出
+                    print(f"执行器控制值已设置: {np.round([data.actuator(name).ctrl[0] for name in actuator_names], 4)}")
+                else:
+                    print("joint_velocities 为 None，未设置控制值")
             
             # 3. 在图像上绘制特征点
             image_with_features = visual_servo_controller.draw_feature_points(rgb_image)
@@ -119,7 +160,7 @@ def main():
                 visual_servo_controller.set_desired_features(points)
                 print(f"已设置新的目标特征点")
             else:
-                # 让键盘控制器处理其他按键
+                 # 让键盘控制器处理其他按键
                 keyboard_controller.process_key_input(key_pressed)
             
             viewer.sync()
