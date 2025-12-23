@@ -17,4 +17,6 @@ pip install "numpy>=1.21.6,<2" \
             "matplotlib" \
             "mujoco>=3.0" \
             "roboticstoolbox-python"
+
+pip install opencv-python==4.10.0.84
             
