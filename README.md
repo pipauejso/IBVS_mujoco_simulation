@@ -21,8 +21,7 @@
 ## 安装
 1. **克隆仓库**
    ```bash
-   git clone https://github.com/your-username/your-repo.git
-   cd your-repo
+   git clone https://github.com/pipauejso/IBVS_mujoco_simulation.git
    ```
 
 2. **创建虚拟环境**
