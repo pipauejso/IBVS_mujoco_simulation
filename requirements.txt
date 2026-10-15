@@ -1,0 +1,6 @@
+# Validated on Python 3.10 / Windows using the existing mujoco conda env.
+numpy==2.2.6
+scipy==1.15.3
+mujoco==3.4.0
+opencv-python==4.13.0.92
+matplotlib==3.10.8

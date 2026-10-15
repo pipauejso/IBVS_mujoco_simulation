@@ -24,12 +24,19 @@ class KeyboardController:
         
         # 存储当前位置和姿态
         self.current_pos = np.zeros(3)
-        self.current_euler = np.zeros(3)
         
         self.update_current_state()
         
         # 键位映射
         self.key_mappings = {
+            2424832: np.array([-1, 0, 0]),  # Windows left (waitKeyEx)
+            2555904: np.array([1, 0, 0]),   # Windows right
+            2490368: np.array([0, 1, 0]),   # Windows up
+            2621440: np.array([0, -1, 0]),  # Windows down
+            65361: np.array([-1, 0, 0]),    # X11 left
+            65363: np.array([1, 0, 0]),
+            65362: np.array([0, 1, 0]),
+            65364: np.array([0, -1, 0]),
             81: np.array([-1, 0, 0]),   # 左箭头 - X减小
             83: np.array([1, 0, 0]),    # 右箭头 - X增大
             82: np.array([0, 1, 0]),    # 上箭头 - Y增大
@@ -56,11 +63,12 @@ class KeyboardController:
         # 转换为 Scipy 顺序 [x, y, z, w]
         scipy_quat = np.array([mj_quat[1], mj_quat[2], mj_quat[3], mj_quat[0]])
         rot = Rotation.from_quat(scipy_quat)
-        self.current_euler = rot.as_euler('xyz', degrees=False)
+        self.current_rotation = rot
     
     def process_key_input(self, key_pressed):
         """处理键盘输入并更新mocap body位置或姿态"""
         if key_pressed in self.key_mappings:
+            self.update_current_state()
             direction = self.key_mappings[key_pressed]
             
             if key_pressed not in self.rotation_keys:
@@ -71,13 +79,14 @@ class KeyboardController:
             else:
                 # 旋转控制
                 rotation_step = 0.1  # 弧度
-                new_euler = self.current_euler + direction * rotation_step
+                # Compose a world-axis increment without Euler singularities.
+                new_rotation = Rotation.from_rotvec(direction * rotation_step) * self.current_rotation
                 # Scipy 返回 [x, y, z, w]
-                scipy_quat = Rotation.from_euler('xyz', new_euler).as_quat()
+                scipy_quat = new_rotation.as_quat()
                 # 转换为 MuJoCo 顺序 [w, x, y, z]
                 mj_quat = np.array([scipy_quat[3], scipy_quat[0], scipy_quat[1], scipy_quat[2]])
                 self.data.mocap_quat[self.mocap_id] = mj_quat
-                self.current_euler = new_euler
+                self.current_rotation = new_rotation
             
             return True
         return False

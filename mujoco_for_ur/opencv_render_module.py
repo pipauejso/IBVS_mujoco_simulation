@@ -55,8 +55,11 @@ class OpenCVRenderer:
         cv2.imshow(self.window_name, image)
         
         # 检查键盘输入
-        key_pressed = cv2.waitKey(1)
+        key_pressed = cv2.waitKeyEx(1)
         return key_pressed
+
+    def is_window_open(self):
+        return cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) >= 1
     
     def process_image(self, image, operations=None):
         """
