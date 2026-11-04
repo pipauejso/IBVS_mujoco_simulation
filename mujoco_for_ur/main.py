@@ -1,4 +1,4 @@
-"""Interactive UR5e IBVS and deterministic rendered-image reproduction."""
+"""UR5e IBVS course framework: preview, interactive control and evaluation."""
 import sys
 sys.dont_write_bytecode = True
 
@@ -81,7 +81,8 @@ def save_rgb(path, image):
         raise RuntimeError(f"Could not save image: {path}")
 
 
-def save_results(output, records, model, data, controller, reference_pose, scenario, dt):
+def save_results(output, records, model, data, controller, reference_pose, scenario, dt,
+                 preview=False):
     columns = (["time_s", "error_rms_px", "detected"] +
                [f"q{i+1}_rad" for i in range(6)] +
                [f"qdot{i+1}_rad_s" for i in range(6)] +
@@ -111,6 +112,10 @@ def save_results(output, records, model, data, controller, reference_pose, scena
     }
     summary["passed"] = bool(final is not None and final < 1.0 and losses == 0
                              and summary["relative_orientation_error_deg"] < 3.0)
+    summary["evaluation"] = "not_evaluated" if preview else "closed_loop"
+    if preview:
+        summary["passed"] = None
+        summary["feature_loss_frames"] = None
     (output / "summary.json").write_text(
         json.dumps(summary, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     import matplotlib
@@ -140,6 +145,8 @@ def save_results(output, records, model, data, controller, reference_pose, scena
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--preview", action="store_true",
+                        help="Preview camera/scene without student detection or control")
     parser.add_argument("--headless", action="store_true", help="Offscreen rendering, no GUI windows")
     parser.add_argument("--demo", action="store_true", help="Capture reference, perturb target, enable IBVS")
     parser.add_argument("--scenario", choices=["translation", "depth", "rotation", "tilt", "combined"],
@@ -148,12 +155,14 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="Results directory, default <repo>/results/<scenario>")
     parser.add_argument("--record", action="store_true", help="Save annotated camera.mp4 (50 fps)")
     args = parser.parse_args(argv)
-    if args.headless and not args.demo:
-        parser.error("--headless requires --demo")
+    if args.preview and args.demo:
+        parser.error("--preview and --demo cannot be used together")
+    if args.headless and not (args.demo or args.preview):
+        parser.error("--headless requires --demo or --preview")
     if args.steps is not None and args.steps <= 0:
         parser.error("--steps must be positive")
-    limit = args.steps if args.steps is not None else (600 if args.demo else None)
-    run_name = args.scenario if args.demo else "interactive"
+    limit = args.steps if args.steps is not None else (600 if args.demo or args.headless else None)
+    run_name = "preview" if args.preview else (args.scenario if args.demo else "interactive")
     output = (args.output or ROOT.parent / "results" / run_name).resolve()
     output.mkdir(parents=True, exist_ok=True)
 
@@ -172,9 +181,10 @@ def main(argv=None):
         renderer.setup_offscreen_rendering()
         cleanup.callback(renderer.cleanup)
         reference = renderer.render_image()
-        points, _ = controller.get_feature_points(reference)
-        if not controller.set_desired_features(points):
-            raise RuntimeError("No complete target visible in reference image")
+        if not args.preview:
+            points, _ = controller.get_feature_points(reference)
+            if not controller.set_desired_features(points):
+                raise RuntimeError("No complete target visible in reference image")
         reference_pose = target_relative_pose(model, data, controller.camera_id)
         save_rgb(output / "reference.png", controller.draw_feature_points(reference))
         if args.demo:
@@ -187,7 +197,9 @@ def main(argv=None):
             gui = OpenCVRenderer("End-Effector Camera", resolution)
             cleanup.callback(gui.cleanup)
             keyboard = KeyboardController(model, data, "target", step_size=0.01)
-            print("Reference captured. v: servo; t: new reference; s: screenshot; ESC: quit.")
+            print("Preview: detection/control disabled. s: screenshot; ESC: quit."
+                  if args.preview else
+                  "Reference captured. v: servo; t: new reference; s: screenshot; ESC: quit.")
         if args.record:
             video = cv2.VideoWriter(str(output / "camera.mp4"),
                                     cv2.VideoWriter_fourcc(*"mp4v"), 1 / dt, resolution)
@@ -204,7 +216,8 @@ def main(argv=None):
             if enabled:
                 command = controller.process_visual_servo(robot, image=image)
             else:
-                controller.get_feature_points(image)
+                if not args.preview:
+                    controller.get_feature_points(image)
                 command = np.zeros(model.nu)
             data.ctrl[:] = command
             error = controller.error_rms_px
@@ -219,7 +232,9 @@ def main(argv=None):
                 key = gui.show_image(annotated)
                 if key == 27 or not gui.is_window_open():
                     break
-                if key == ord("v"):
+                if args.preview and key in (ord("v"), ord("t")):
+                    print("Preview mode: implement the TODOs, then run without --preview.")
+                elif key == ord("v"):
                     enabled = not enabled
                     data.ctrl[:] = 0
                     print(f"Servo {'enabled' if enabled else 'disabled'}")
@@ -245,12 +260,18 @@ def main(argv=None):
                     time.sleep(remaining)
         data.ctrl[:] = 0
         final_image = renderer.render_image()
-        controller.get_feature_points(final_image)
+        if not args.preview:
+            controller.get_feature_points(final_image)
         save_rgb(output / "final.png", controller.draw_feature_points(final_image))
     summary = save_results(output, records, model, data, controller,
-                           reference_pose, run_name, dt)
+                           reference_pose, run_name, dt, preview=args.preview)
     return 0 if not args.demo or summary["passed"] else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except NotImplementedError as exc:
+        print(f"\n{exc}\n环境预览请运行：python mujoco_for_ur/main.py --preview",
+              file=sys.stderr)
+        raise SystemExit(2)

@@ -1,7 +1,10 @@
-"""Four-point IBVS, using RGB detections and simulation-only metric depth."""
+"""课程框架：连接学生检测/控制模块，提供深度、状态管理与停车保护。"""
 
 import cv2
 import numpy as np
+
+from feature_detection import detect_feature_points
+from ibvs_controller import calculate_interaction_matrix, compute_joint_velocity
 
 
 class VisualServoController:
@@ -27,39 +30,14 @@ class VisualServoController:
         return float(focal), float(focal), (width - 1) / 2, (height - 1) / 2
 
     def _extract_features_from_image(self, image):
-        hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-        mask = (cv2.inRange(hsv, (0, 70, 40), (10, 255, 255)) |
-                cv2.inRange(hsv, (170, 70, 40), (180, 255, 255)))
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        previous = None if self.current_points is None else self.current_points.copy()
+        points, success = detect_feature_points(image, previous)
+        if not success:
             return None, False
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 30:
-            return None, False
-        # An enclosing rectangle destroys perspective on a tilted target.
-        polygon = cv2.approxPolyDP(contour, 0.02 * cv2.arcLength(contour, True), True)
-        if len(polygon) != 4 or not cv2.isContourConvex(polygon):
-            return None, False
-        corners = polygon.reshape(4, 2).astype(np.float32)
-        width, height = self.resolution
-        if (np.any(corners[:, 0] < 5) or np.any(corners[:, 0] > width - 6) or
-                np.any(corners[:, 1] < 5) or np.any(corners[:, 1] > height - 6)):
-            return None, False
-        term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-        corners = cv2.cornerSubPix(mask, corners.reshape(-1, 1, 2),
-                                  (4, 4), (-1, -1), term).reshape(4, 2)
-        centre = corners.mean(axis=0)
-        order = np.argsort(np.arctan2(corners[:, 1] - centre[1],
-                                     corners[:, 0] - centre[0]))
-        corners = corners[order]
-        if self.current_points is None:
-            corners = np.roll(corners, -np.argmin(corners.sum(axis=1)), axis=0)
-        else:
-            # Preserve identities across the 45-degree sorting boundary.
-            candidates = [np.roll(corners, i, axis=0) for i in range(4)]
-            corners = min(candidates, key=lambda p: np.sum((p - self.current_points)**2))
-        return corners.copy(), True
+        points = np.asarray(points, dtype=np.float64)
+        if points.shape != (4, 2) or not np.all(np.isfinite(points)):
+            raise ValueError("任务 A 必须返回有限的 (4, 2) 角点数组")
+        return points.copy(), True
 
     def _get_depth_for_points(self, points):
         """Intersect each detected pixel ray with the visible target face.
@@ -120,12 +98,8 @@ class VisualServoController:
         depths = np.asarray(Z, dtype=np.float64).reshape(4)
         if np.any(depths <= 0) or not np.all(np.isfinite(depths)):
             raise ValueError("Feature depths must be finite and positive")
-        L = np.zeros((8, 6))
-        for i, ((u, v), z) in enumerate(zip(points, depths)):
-            x, y = (u - self.cx) / self.fx, (v - self.cy) / self.fy
-            L[2*i:2*i+2] = [[-1/z, 0, x/z, x*y, -(1+x*x), y],
-                              [0, -1/z, y/z, 1+y*y, -x*y, -x]]
-        return L
+        return calculate_interaction_matrix(
+            points, depths, (self.fx, self.fy, self.cx, self.cy))
 
     def process_visual_servo(self, robot_controller, current_joint_angles=None, image=None):
         points, depths = self.get_feature_points(image)
@@ -137,14 +111,13 @@ class VisualServoController:
             return np.zeros(self.model.nv)
         if self.error_rms_px < self.tolerance_px:
             return np.zeros(self.model.nv)
-        # e = current - desired; sdot = L J qdot; qdot = -gain (LJ)^+ e.
-        error = ((points - self.desired_points) / [self.fx, self.fy]).reshape(8)
-        image_jacobian = (self.calculate_interaction_matrix(points, depths) @
-                          robot_controller.get_jacobian(current_joint_angles))
-        damping = 1e-4
-        velocity = -self.lambda_gain * np.linalg.solve(
-            image_jacobian.T @ image_jacobian + damping**2 * np.eye(self.model.nv),
-            image_jacobian.T @ error)
+        velocity = np.array(compute_joint_velocity(
+            points, self.desired_points.copy(), depths,
+            (self.fx, self.fy, self.cx, self.cy),
+            robot_controller.get_jacobian(current_joint_angles),
+            lambda_gain=self.lambda_gain, damping=1e-4), dtype=np.float64, copy=True)
+        if velocity.shape != (self.model.nv,):
+            raise ValueError(f"任务 B2 必须返回 ({self.model.nv},) 关节速度数组")
         if not np.all(np.isfinite(velocity)):
             return np.zeros(self.model.nv)
         # Uniform scaling preserves the descent direction under saturation.

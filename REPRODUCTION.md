@@ -1,5 +1,9 @@
 # UR5e IBVS 本地复现记录
 
+> 本文记录改为课程填空版之前的教师参考实现，结果不代表当前学生模板已完成。
+> 当前课程要求、待实现接口与分阶段运行方法以 [README.md](README.md) 为准。
+> 文中旧算法脚本在学生版中已停用；未完成 TODO 时不能运行完整闭环验收。
+
 本版本在 https://github.com/pipauejso/IBVS_mujoco_simulation 的基线提交
 `f5ee24eda4978631f009b03ef64a3f48af26eb08` 上完成修复与验证。修复已纳入当前代码版本。
 首次安装、克隆与启动步骤见 [README.md](README.md)，以下命令均在克隆后的项目根目录执行。

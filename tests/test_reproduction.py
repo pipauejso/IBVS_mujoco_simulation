@@ -1,7 +1,8 @@
-"""Regression checks for geometry, correspondence, and stopping behavior."""
+"""Course acceptance checks; student tasks intentionally fail until implemented."""
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import cv2
 import mujoco
@@ -16,7 +17,10 @@ from visual_servo_module import VisualServoController
 from keyboard_controller import KeyboardController
 
 
-class ReproductionTests(unittest.TestCase):
+from ibvs_controller import calculate_interaction_matrix, compute_joint_velocity
+
+
+class ServoFixture:
     @classmethod
     def setUpClass(cls):
         cls.model, _ = load_simulation()
@@ -35,6 +39,94 @@ class ReproductionTests(unittest.TestCase):
         points = xyz[:, :2] / xyz[:, 2:3]
         return points * [self.servo.fx, self.servo.fy] + [self.servo.cx, self.servo.cy], xyz[:, 2]
 
+
+class FrameworkTests(ServoFixture, unittest.TestCase):
+    def test_depth_is_paired_to_pixels_on_tilted_face(self):
+        mocap = self.model.body_mocapid[self.model.body("target").id]
+        original = Rotation.from_quat(self.data.mocap_quat[mocap][[1, 2, 3, 0]])
+        self.data.mocap_quat[mocap] = (original * Rotation.from_euler(
+            "xy", [12, -10], degrees=True)).as_quat()[[3, 0, 1, 2]]
+        mujoco.mj_forward(self.model, self.data)
+        geom = self.servo.geom_id
+        local = np.array([[-.05, -.05, .01], [.05, -.05, .01],
+                          [.05, .05, .01], [-.05, .05, .01]])
+        world = local @ self.data.geom_xmat[geom].reshape(3, 3).T + self.data.geom_xpos[geom]
+        points, expected = self.project(world)
+        order = [2, 0, 3, 1]
+        actual = self.servo._get_depth_for_points(points[order])
+        np.testing.assert_allclose(actual, expected[order], atol=1e-12)
+
+    def test_feature_loss_commands_zero_velocity(self):
+        self.servo.set_desired_features(np.array([[100, 60], [220, 60], [220, 180], [100, 180]]))
+        with patch("visual_servo_module.detect_feature_points", return_value=(None, False)):
+            velocity = self.servo.process_visual_servo(self.robot,
+                        image=np.zeros((240, 320, 3), np.uint8))
+        np.testing.assert_array_equal(velocity, np.zeros(6))
+        self.assertIsNone(self.servo.error_rms_px)
+
+    def test_failed_reference_does_not_destroy_previous_reference(self):
+        reference = np.array([[100, 60], [220, 60], [220, 180], [100, 180]])
+        self.assertTrue(self.servo.set_desired_features(reference))
+        reference[:] = 0  # stored reference must be a copy
+        self.assertFalse(self.servo.set_desired_features(None))
+        self.assertEqual(self.servo.desired_points[0, 0], 100)
+
+    def test_windows_arrow_keys_move_target(self):
+        keyboard = KeyboardController(self.model, self.data, step_size=.01)
+        initial = self.data.mocap_pos[keyboard.mocap_id].copy()
+        self.assertTrue(keyboard.process_key_input(2555904))
+        np.testing.assert_allclose(self.data.mocap_pos[keyboard.mocap_id], initial + [.01, 0, 0])
+
+    def test_world_axis_rotation_at_initial_gimbal_lock_pose(self):
+        keyboard = KeyboardController(self.model, self.data)
+        before = self.data.mocap_quat[keyboard.mocap_id][[1, 2, 3, 0]]
+        expected = (Rotation.from_rotvec([0, 0, .1]) *
+                    Rotation.from_quat(before)).as_matrix()
+        keyboard.process_key_input(ord('3'))
+        after = self.data.mocap_quat[keyboard.mocap_id][[1, 2, 3, 0]]
+        np.testing.assert_allclose(Rotation.from_quat(after).as_matrix(), expected, atol=1e-12)
+
+
+class DetectionTests(ServoFixture, unittest.TestCase):
+    def test_empty_image_reports_feature_loss(self):
+        points, success = self.servo._extract_features_from_image(
+            np.zeros((240, 320, 3), np.uint8))
+        self.assertFalse(success)
+        self.assertIsNone(points)
+
+    def test_perspective_corners_are_not_replaced_by_a_rectangle(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        expected = np.array([[90, 60], [220, 80], [200, 180], [110, 165]], np.float32)
+        cv2.fillConvexPoly(image, expected.astype(np.int32), (255, 0, 0))
+        actual, success = self.servo._extract_features_from_image(image)
+        self.assertTrue(success)
+        np.testing.assert_allclose(actual, expected, atol=1.5)
+
+    def test_corner_identity_across_45_degree_boundary(self):
+        base = np.array([[-45, -45], [45, -45], [45, 45], [-45, 45]])
+        first = None
+        for angle in range(35, 57, 3):
+            r = Rotation.from_euler("z", angle, degrees=True).as_matrix()[:2, :2]
+            polygon = base @ r.T + [160, 120]
+            image = np.zeros((240, 320, 3), np.uint8)
+            cv2.fillConvexPoly(image, np.int32(np.round(polygon)), (255, 0, 0))
+            points, success = self.servo._extract_features_from_image(image)
+            self.assertTrue(success)
+            if first is None:
+                first = points.copy()
+            if self.servo.current_points is not None:
+                self.assertLess(np.max(np.linalg.norm(points - self.servo.current_points, axis=1)), 7)
+            self.servo.current_points = points
+
+    def test_clipped_target_is_rejected(self):
+        image = np.zeros((240, 320, 3), np.uint8)
+        cv2.rectangle(image, (0, 50), (80, 150), (255, 0, 0), -1)
+        points, success = self.servo._extract_features_from_image(image)
+        self.assertFalse(success)
+        self.assertIsNone(points)
+
+
+class ControllerTests(ServoFixture, unittest.TestCase):
     def test_full_image_jacobian_against_finite_differences(self):
         """Checks sign, all six axes, and the camera translational offset."""
         target = self.model.body("target").id
@@ -62,84 +154,33 @@ class ReproductionTests(unittest.TestCase):
                 numeric[:, i] = ((plus - minus) / [self.servo.fx, self.servo.fy]).ravel() / (2 * eps)
             np.testing.assert_allclose(analytic, numeric, atol=2e-7, rtol=2e-6)
 
-    def test_perspective_corners_are_not_replaced_by_a_rectangle(self):
-        image = np.zeros((240, 320, 3), np.uint8)
-        expected = np.array([[90, 60], [220, 80], [200, 180], [110, 165]], np.float32)
-        cv2.fillConvexPoly(image, expected.astype(np.int32), (255, 0, 0))
-        actual, success = self.servo._extract_features_from_image(image)
-        self.assertTrue(success)
-        np.testing.assert_allclose(actual, expected, atol=1.5)
-
-    def test_corner_identity_across_45_degree_boundary(self):
-        base = np.array([[-45, -45], [45, -45], [45, 45], [-45, 45]])
-        first = None
-        for angle in range(35, 57, 3):
-            r = Rotation.from_euler("z", angle, degrees=True).as_matrix()[:2, :2]
-            polygon = base @ r.T + [160, 120]
-            image = np.zeros((240, 320, 3), np.uint8)
-            cv2.fillConvexPoly(image, np.int32(np.round(polygon)), (255, 0, 0))
-            points, success = self.servo._extract_features_from_image(image)
-            self.assertTrue(success)
-            if first is None:
-                first = points.copy()
-            if self.servo.current_points is not None:
-                self.assertLess(np.max(np.linalg.norm(points - self.servo.current_points, axis=1)), 7)
-            self.servo.current_points = points
-
-    def test_depth_is_paired_to_pixels_on_tilted_face(self):
-        mocap = self.model.body_mocapid[self.model.body("target").id]
-        original = Rotation.from_quat(self.data.mocap_quat[mocap][[1, 2, 3, 0]])
-        self.data.mocap_quat[mocap] = (original * Rotation.from_euler(
-            "xy", [12, -10], degrees=True)).as_quat()[[3, 0, 1, 2]]
-        mujoco.mj_forward(self.model, self.data)
-        geom = self.servo.geom_id
-        local = np.array([[-.05, -.05, .01], [.05, -.05, .01],
-                          [.05, .05, .01], [-.05, .05, .01]])
-        world = local @ self.data.geom_xmat[geom].reshape(3, 3).T + self.data.geom_xpos[geom]
-        points, expected = self.project(world)
-        order = [2, 0, 3, 1]
-        actual = self.servo._get_depth_for_points(points[order])
-        np.testing.assert_allclose(actual, expected[order], atol=1e-12)
-
-    def test_feature_loss_commands_zero_velocity(self):
-        self.servo.set_desired_features(np.array([[100, 60], [220, 60], [220, 180], [100, 180]]))
-        velocity = self.servo.process_visual_servo(self.robot,
-                    image=np.zeros((240, 320, 3), np.uint8))
-        np.testing.assert_array_equal(velocity, np.zeros(6))
-        self.assertIsNone(self.servo.error_rms_px)
-
-    def test_clipped_target_is_rejected(self):
-        image = np.zeros((240, 320, 3), np.uint8)
-        cv2.rectangle(image, (0, 50), (80, 150), (255, 0, 0), -1)
-        points, success = self.servo._extract_features_from_image(image)
-        self.assertFalse(success)
-        self.assertIsNone(points)
-
-    def test_failed_reference_does_not_destroy_previous_reference(self):
-        reference = np.array([[100, 60], [220, 60], [220, 180], [100, 180]])
-        self.assertTrue(self.servo.set_desired_features(reference))
-        reference[:] = 0  # stored reference must be a copy
-        self.assertFalse(self.servo.set_desired_features(None))
-        self.assertEqual(self.servo.desired_points[0, 0], 100)
-
-    def test_windows_arrow_keys_move_target(self):
-        keyboard = KeyboardController(self.model, self.data, step_size=.01)
-        initial = self.data.mocap_pos[keyboard.mocap_id].copy()
-        self.assertTrue(keyboard.process_key_input(2555904))
-        np.testing.assert_allclose(self.data.mocap_pos[keyboard.mocap_id], initial + [.01, 0, 0])
-
     def test_invalid_depth_is_rejected(self):
         with self.assertRaises(ValueError):
-            self.servo.calculate_interaction_matrix(np.zeros((4, 2)), [1, -1, 1, 1])
+            calculate_interaction_matrix(np.zeros((4, 2)), [1, -1, 1, 1],
+                                         (self.servo.fx, self.servo.fy, self.servo.cx, self.servo.cy))
 
-    def test_world_axis_rotation_at_initial_gimbal_lock_pose(self):
-        keyboard = KeyboardController(self.model, self.data)
-        before = self.data.mocap_quat[keyboard.mocap_id][[1, 2, 3, 0]]
-        expected = (Rotation.from_rotvec([0, 0, .1]) *
-                    Rotation.from_quat(before)).as_matrix()
-        keyboard.process_key_input(ord('3'))
-        after = self.data.mocap_quat[keyboard.mocap_id][[1, 2, 3, 0]]
-        np.testing.assert_allclose(Rotation.from_quat(after).as_matrix(), expected, atol=1e-12)
+
+    def test_zero_error_produces_zero_velocity(self):
+        points = np.array([[100., 60.], [220., 60.], [220., 180.], [100., 180.]])
+        intrinsics = (self.servo.fx, self.servo.fy, self.servo.cx, self.servo.cy)
+        velocity = compute_joint_velocity(points, points.copy(), np.full(4, .3),
+                                          intrinsics, self.robot.get_jacobian())
+        self.assertEqual(np.asarray(velocity).shape, (6,))
+        np.testing.assert_allclose(velocity, np.zeros(6), atol=1e-12)
+
+    def test_velocity_reduces_linearized_image_error(self):
+        points = np.array([[100., 60.], [220., 60.], [220., 180.], [100., 180.]])
+        desired = points + [8., -5.]
+        depths = np.full(4, .3)
+        intrinsics = (self.servo.fx, self.servo.fy, self.servo.cx, self.servo.cy)
+        jacobian = self.robot.get_jacobian()
+        velocity = np.asarray(compute_joint_velocity(points, desired, depths,
+                                                      intrinsics, jacobian))
+        self.assertEqual(velocity.shape, (6,))
+        self.assertTrue(np.all(np.isfinite(velocity)))
+        error = ((points - desired) / [self.servo.fx, self.servo.fy]).ravel()
+        image_jacobian = self.servo.calculate_interaction_matrix(points, depths) @ jacobian
+        self.assertLess(float(error @ image_jacobian @ velocity), 0.)
 
 
 if __name__ == "__main__":
